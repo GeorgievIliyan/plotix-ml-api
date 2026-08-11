@@ -1,7 +1,7 @@
 import pickle
 import numpy as np
 import pandas as pd
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from pathlib import Path
 from dotenv import load_dotenv
@@ -14,10 +14,11 @@ key = os.getenv('SECURE_KEY')
 
 MODEL_PATH = Path(__file__).parent.parent / "model" / "model.pkl"
 
-def authorize(token: str) -> None:
-    if token != key or token == None:
+
+def authorize(x_api_key: str = Header(...)) -> None:
+    if x_api_key is None or x_api_key != key:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
-        
+
 
 with open(MODEL_PATH, "rb") as f:
     bundle = pickle.load(f)
@@ -59,13 +60,13 @@ class PredictRequest(BaseModel):
     seller_type: int = 1
 
 
-@app.get("/api", _=Depends(authorize))
+@app.get("/api")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/api/predict", _=Depends(authorize))
-def predict(req: PredictRequest):
+@app.post("/api/predict")
+def predict(req: PredictRequest, _=Depends(authorize)):
     if req.area <= 0:
         raise HTTPException(status_code=400, detail="area must be greater than 0")
 
