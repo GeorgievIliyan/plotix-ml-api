@@ -26,10 +26,10 @@ with open(MODEL_PATHS["northpearl"], "rb") as f:
     northpearl_bundle = pickle.load(f)
 
 CITY_MODELS = {
-    "Варна": ("NorthPearl", northpearl_bundle),
-    "София": ("Atlas", atlas_bundle),
-    "Пловдив": ("Atlas", atlas_bundle),
-    "Бургас": ("Atlas", atlas_bundle),
+    "варна": ("NorthPearl", northpearl_bundle),
+    "софия": ("Atlas", atlas_bundle),
+    "пловдив": ("Atlas", atlas_bundle),
+    "бургас": ("Atlas", atlas_bundle),
 }
 
 
