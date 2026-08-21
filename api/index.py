@@ -5,12 +5,16 @@ from fastapi import Depends, FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from pathlib import Path
 from dotenv import load_dotenv
-import os
+from google.cloud import firestore
 
-app = FastAPI()
+BASE_DIR = Path(__file__).resolve().parent.parent
+KEY_PATH = BASE_DIR / ".secret" / "serviceAccount.json"
+
+db = firestore.Client.from_service_account_json(KEY_PATH)
 
 load_dotenv()
-key = os.getenv("SECURE_KEY")
+
+app = FastAPI()
 
 MODEL_DIR = Path(__file__).parent.parent / "model"
 
@@ -34,8 +38,17 @@ CITY_MODELS = {
 
 
 def authorize(x_api_key: str = Header(...)) -> None:
-    if x_api_key is None or x_api_key != key:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+    docs = db.collection("keys").where(
+        "key", "==", x_api_key
+    ).where(
+        "acitve", "==", True
+    ).stream()
+
+    if next(docs, None) is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing X-API-Key"
+        )
 
 
 BUILDING_ERA_CATS = ["стар", "среден", "скорошен", "нов"]
@@ -52,6 +65,7 @@ ROOM_MAP = {
     "garage/parking": 1,
     "other": 2
 }
+
 
 class PredictRequest(BaseModel):
     oblast: str
@@ -86,7 +100,10 @@ def health():
 @app.post("/api/predict")
 def predict(req: PredictRequest, _=Depends(authorize)):
     if req.area <= 0:
-        raise HTTPException(status_code=400, detail="area must be greater than 0")
+        raise HTTPException(
+            status_code=400,
+            detail="area must be greater than 0"
+        )
 
     city_key = req.city.strip().lower()
 
@@ -110,9 +127,20 @@ def predict(req: PredictRequest, _=Depends(authorize)):
     is_top = 1 if req.floor == req.total_floors else 0
     is_middle = 1 if (not is_ground and not is_top) else 0
 
-    dist_base = district_medians.get(req.district, global_median)
-    city_base = city_medians.get(req.city, global_median)
-    estimated_rooms = ROOM_MAP.get(req.type, 2)
+    dist_base = district_medians.get(
+        req.district,
+        global_median
+    )
+
+    city_base = city_medians.get(
+        req.city,
+        global_median
+    )
+
+    estimated_rooms = ROOM_MAP.get(
+        req.type,
+        2
+    )
 
     # без негативен ефект | no negative effect
     def to_nan(v):
@@ -133,8 +161,16 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         "is_ground": is_ground,
         "is_top": is_top,
         "is_middle": is_middle,
-        "construction": req.construction if req.construction in category_values["construction"] else "тухла",
-        "изложение": req.izlozhenie if req.izlozhenie in category_values["изложение"] else "юг",
+        "construction": (
+            req.construction
+            if req.construction in category_values["construction"]
+            else "тухла"
+        ),
+        "изложение": (
+            req.izlozhenie
+            if req.izlozhenie in category_values["изложение"]
+            else "юг"
+        ),
         "elevator": to_nan(req.elevator),
         "access_control": to_nan(req.access_control),
         "parking": to_nan(req.parking),
@@ -147,9 +183,21 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         "is_lux": to_nan(req.is_lux),
         "seller_type": req.seller_type,
         "building_age": req.building_age,
-        "building_era": req.building_era if req.building_era in BUILDING_ERA_CATS else "среден",
-        "renovated_x_lux": 1.0 if (req.is_renovated and req.is_lux) else np.nan,
-        "furnished_x_renovated": 1.0 if (req.furnished and req.is_renovated) else np.nan,
+        "building_era": (
+            req.building_era
+            if req.building_era in BUILDING_ERA_CATS
+            else "среден"
+        ),
+        "renovated_x_lux": (
+            1.0
+            if (req.is_renovated and req.is_lux)
+            else np.nan
+        ),
+        "furnished_x_renovated": (
+            1.0
+            if (req.furnished and req.is_renovated)
+            else np.nan
+        ),
     }
 
     input_df = pd.DataFrame([row])
@@ -167,7 +215,10 @@ def predict(req: PredictRequest, _=Depends(authorize)):
                 categories=category_values[col]
             )
 
-    pred_log = model.predict(input_df[features])[0]
+    pred_log = model.predict(
+        input_df[features]
+    )[0]
+
     pred_price_sqm = float(np.exp(pred_log))
     total_price = pred_price_sqm * req.area
 
