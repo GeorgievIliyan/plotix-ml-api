@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 from google.cloud import firestore
+from upstash_redis import Redis
 
 
 load_dotenv()
@@ -20,6 +21,12 @@ if os.getenv("GOOGLE_CREDENTIALS"):
     db = firestore.Client.from_service_account_info(credentials)
 else:
     db = firestore.Client.from_service_account_json(KEY_PATH)
+
+
+redis = Redis(
+    url=os.getenv("UPSTASH_REDIS_REST_URL"),
+    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
+)
 
 
 app = FastAPI()
@@ -57,6 +64,19 @@ def authorize(x_api_key: str = Header(...)) -> None:
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing X-API-Key"
+        )
+
+    rate_limit_key = f"rate_limit:{x_api_key}"
+
+    count = redis.incr(rate_limit_key)
+
+    if count == 1:
+        redis.expire(rate_limit_key, 60)
+
+    if count > 10:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded"
         )
 
 
