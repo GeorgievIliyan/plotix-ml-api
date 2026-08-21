@@ -1,18 +1,26 @@
 import pickle
+import json
 import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from pathlib import Path
 from dotenv import load_dotenv
+import os
 from google.cloud import firestore
+
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 KEY_PATH = BASE_DIR / ".secret" / "serviceAccount.json"
 
-db = firestore.Client.from_service_account_json(KEY_PATH)
+if os.getenv("GOOGLE_CREDENTIALS"):
+    credentials = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+    db = firestore.Client.from_service_account_info(credentials)
+else:
+    db = firestore.Client.from_service_account_json(KEY_PATH)
 
-load_dotenv()
 
 app = FastAPI()
 
@@ -29,6 +37,7 @@ with open(MODEL_PATHS["atlas"], "rb") as f:
 with open(MODEL_PATHS["northpearl"], "rb") as f:
     northpearl_bundle = pickle.load(f)
 
+
 CITY_MODELS = {
     "варна": ("NorthPearl", northpearl_bundle),
     "софия": ("Atlas", atlas_bundle),
@@ -38,11 +47,11 @@ CITY_MODELS = {
 
 
 def authorize(x_api_key: str = Header(...)) -> None:
-    docs = db.collection("keys").where(
-        "key", "==", x_api_key
-    ).where(
-        "acitve", "==", True
-    ).stream()
+    docs = (
+        db.collection("keys")
+        .where("key", "==", x_api_key)
+        .stream()
+    )
 
     if next(docs, None) is None:
         raise HTTPException(
