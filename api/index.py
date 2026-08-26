@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import os
 from google.cloud import firestore
 from upstash_redis import Redis
-
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -36,13 +36,33 @@ MODEL_DIR = Path(__file__).parent.parent / "model"
 MODEL_PATHS = {
     "atlas": MODEL_DIR / "plotix_atlas.pkl",
     "northpearl": MODEL_DIR / "plotix_northpearl.pkl",
+    "horizon": MODEL_DIR / "plotix_horizon.pkl"
 }
 
+CSV_PATH = MODEL_DIR / "listings.csv"
+
+
+# Load models
 with open(MODEL_PATHS["atlas"], "rb") as f:
     atlas_bundle = pickle.load(f)
 
 with open(MODEL_PATHS["northpearl"], "rb") as f:
     northpearl_bundle = pickle.load(f)
+
+with open(MODEL_PATHS["horizon"], "rb") as f:
+    horizon_bundle = pickle.load(f)
+
+
+# Load cities from CSV
+df = pd.read_csv(CSV_PATH)
+
+cities_from_csv = set(
+    df["city"]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .str.lower()
+)
 
 
 CITY_MODELS = {
@@ -54,16 +74,24 @@ CITY_MODELS = {
 
 
 def authorize(x_api_key: str = Header(...)) -> None:
-    docs = (
+    docs = list(
         db.collection("keys")
         .where("key", "==", x_api_key)
         .stream()
     )
 
-    if next(docs, None) is None:
+    if not docs:
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing X-API-Key"
+        )
+
+    expires_at = docs[0].to_dict().get("expiresAt")
+
+    if expires_at and expires_at < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=401,
+            detail="API key has expired"
         )
 
     rate_limit_key = f"rate_limit:{x_api_key}"
@@ -80,7 +108,12 @@ def authorize(x_api_key: str = Header(...)) -> None:
         )
 
 
-BUILDING_ERA_CATS = ["стар", "среден", "скорошен", "нов"]
+BUILDING_ERA_CATS = [
+    "стар",
+    "среден",
+    "скорошен",
+    "нов"
+]
 
 ROOM_MAP = {
     "1 room": 1,
@@ -136,13 +169,18 @@ def predict(req: PredictRequest, _=Depends(authorize)):
 
     city_key = req.city.strip().lower()
 
-    if city_key not in CITY_MODELS:
+    if city_key in CITY_MODELS:
+        model_name, bundle = CITY_MODELS[city_key]
+
+    elif city_key in cities_from_csv:
+        model_name = "Horizon"
+        bundle = horizon_bundle
+
+    else:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported city: {req.city}"
         )
-
-    model_name, bundle = CITY_MODELS[city_key]
 
     model = bundle["model"]
     district_medians = bundle["district_medians"]
