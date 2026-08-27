@@ -3,3 +3,5 @@
 .env.local
 .env
 .secret/
+__pycache__/
+__pycache__

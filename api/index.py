@@ -36,6 +36,7 @@ try:
             logger.error(f"Service account key not found: {KEY_PATH}")
             raise FileNotFoundError(f"Service account key not found: {KEY_PATH}")
         db = firestore.Client.from_service_account_json(KEY_PATH)
+    logger.info(f"Firestore connected to project: {db.project}")
 except Exception as e:
     logger.error(f"Failed to initialize Firestore: {e}")
     raise
@@ -107,23 +108,25 @@ CITY_MODELS = {
 }
 
 def authorize(x_api_key: str = Header(...)) -> None:
+    normalized_key = x_api_key.strip()
+
     try:
         docs = list(
             db.collection("keys")
-            .where("key", "==", x_api_key)
+            .where("key", "==", normalized_key)
             .stream()
         )
     except Exception as e:
         logger.error(f"Firestore query failed: {e}")
         raise HTTPException(
-            status_code=500,
-            detail="Authorization service unavailable"
+            status_code=503,
+            detail="Service temporarily unavailable"
         )
 
     if not docs:
         raise HTTPException(
             status_code=401,
-            detail="Invalid or missing X-API-Key"
+            detail="Unauthorized"
         )
 
     try:
@@ -131,18 +134,18 @@ def authorize(x_api_key: str = Header(...)) -> None:
         if expires_at and expires_at < datetime.now(timezone.utc):
             raise HTTPException(
                 status_code=401,
-                detail="API key has expired"
+                detail="Unauthorized"
             )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to check expiration: {e}")
         raise HTTPException(
-            status_code=500,
-            detail="Authorization validation failed"
+            status_code=503,
+            detail="Service temporarily unavailable"
         )
 
-    rate_limit_key = f"rate_limit:{x_api_key}"
+    rate_limit_key = f"rate_limit:{normalized_key}"
 
     try:
         count = redis.incr(rate_limit_key)
@@ -158,8 +161,8 @@ def authorize(x_api_key: str = Header(...)) -> None:
     except Exception as e:
         logger.error(f"Redis rate limit failed: {e}")
         raise HTTPException(
-            status_code=500,
-            detail="Rate limiting service unavailable"
+            status_code=503,
+            detail="Service temporarily unavailable"
         )
 
 BUILDING_ERA_CATS = [
@@ -215,7 +218,7 @@ def predict(req: PredictRequest, _=Depends(authorize)):
     if req.area <= 0:
         raise HTTPException(
             status_code=400,
-            detail="area must be greater than 0"
+            detail="Invalid request"
         )
 
     city_key = req.city.strip().lower()
@@ -228,14 +231,14 @@ def predict(req: PredictRequest, _=Depends(authorize)):
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported city: {req.city}"
+            detail="Invalid request"
         )
 
     try:
         model = bundle.get("model")
         if model is None:
             raise ValueError("Model not found in bundle")
-        
+
         district_medians = bundle.get("district_medians", {})
         city_medians = bundle.get("city_medians", {})
         global_median = bundle.get("global_median", 0)
@@ -374,22 +377,10 @@ def predict(req: PredictRequest, _=Depends(authorize)):
 
     except HTTPException:
         raise
-    except KeyError as e:
-        logger.error(f"Key error in predict: {e}")
-        raise HTTPException(
-            status_code=422,
-            detail=f"Missing data field: {e}"
-        )
-    except ValueError as e:
-        logger.error(f"Value error in predict: {e}")
-        raise HTTPException(
-            status_code=422,
-            detail=str(e)
-        )
     except Exception as e:
         logger.error("Predict failed for req=%s", req.model_dump())
         logger.error(traceback.format_exc())
         raise HTTPException(
-            status_code=422,
-            detail=f"{type(e).__name__}: {str(e)}"
+            status_code=500,
+            detail="Prediction failed"
         )
