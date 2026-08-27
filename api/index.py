@@ -13,7 +13,13 @@ from google.cloud import firestore
 from upstash_redis import Redis
 from datetime import datetime, timezone
 
-load_dotenv()
+env_path = Path(__file__).resolve().parent.parent / '.env.local'
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+else:
+    env_path = Path(__file__).resolve().parent / '.env.local'
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
 
 logger = logging.getLogger("plotix_predict")
 logging.basicConfig(level=logging.INFO)
@@ -21,18 +27,31 @@ logging.basicConfig(level=logging.INFO)
 BASE_DIR = Path(__file__).resolve().parent.parent
 KEY_PATH = BASE_DIR / ".secret" / "serviceAccount.json"
 
-if os.getenv("GOOGLE_CREDENTIALS"):
-    credentials = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-    db = firestore.Client.from_service_account_info(credentials)
-else:
-    db = firestore.Client.from_service_account_json(KEY_PATH)
+try:
+    if os.getenv("GOOGLE_CREDENTIALS"):
+        credentials = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+        db = firestore.Client.from_service_account_info(credentials)
+    else:
+        if not KEY_PATH.exists():
+            logger.error(f"Service account key not found: {KEY_PATH}")
+            raise FileNotFoundError(f"Service account key not found: {KEY_PATH}")
+        db = firestore.Client.from_service_account_json(KEY_PATH)
+except Exception as e:
+    logger.error(f"Failed to initialize Firestore: {e}")
+    raise
 
+redis_url = os.getenv("UPSTASH_REDIS_REST_URL")
+redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-redis = Redis(
-    url=os.getenv("UPSTASH_REDIS_REST_URL"),
-    token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
-)
+if not redis_url or not redis_token:
+    logger.error("Redis credentials not configured")
+    raise ValueError("Redis credentials not configured")
 
+try:
+    redis = Redis(url=redis_url, token=redis_token)
+except Exception as e:
+    logger.error(f"Failed to initialize Redis: {e}")
+    raise
 
 app = FastAPI()
 
@@ -46,18 +65,31 @@ MODEL_PATHS = {
 
 CSV_PATH = MODEL_DIR / "listings.csv"
 
+for name, path in MODEL_PATHS.items():
+    if not path.exists():
+        logger.error(f"Model file not found: {path}")
+        raise FileNotFoundError(f"Model file not found: {path}")
 
-with open(MODEL_PATHS["atlas"], "rb") as f:
-    atlas_bundle = pickle.load(f)
+if not CSV_PATH.exists():
+    logger.error(f"CSV file not found: {CSV_PATH}")
+    raise FileNotFoundError(f"CSV file not found: {CSV_PATH}")
 
-with open(MODEL_PATHS["northpearl"], "rb") as f:
-    northpearl_bundle = pickle.load(f)
+try:
+    with open(MODEL_PATHS["atlas"], "rb") as f:
+        atlas_bundle = pickle.load(f)
+    with open(MODEL_PATHS["northpearl"], "rb") as f:
+        northpearl_bundle = pickle.load(f)
+    with open(MODEL_PATHS["horizon"], "rb") as f:
+        horizon_bundle = pickle.load(f)
+except Exception as e:
+    logger.error(f"Failed to load pickle files: {e}")
+    raise
 
-with open(MODEL_PATHS["horizon"], "rb") as f:
-    horizon_bundle = pickle.load(f)
-
-
-df = pd.read_csv(CSV_PATH)
+try:
+    df = pd.read_csv(CSV_PATH)
+except Exception as e:
+    logger.error(f"Failed to read CSV: {e}")
+    raise
 
 cities_from_csv = set(
     df["city"]
@@ -67,7 +99,6 @@ cities_from_csv = set(
     .str.lower()
 )
 
-
 CITY_MODELS = {
     "варна": ("NorthPearl", northpearl_bundle),
     "софия": ("Atlas", atlas_bundle),
@@ -75,13 +106,19 @@ CITY_MODELS = {
     "бургас": ("Atlas", atlas_bundle),
 }
 
-
 def authorize(x_api_key: str = Header(...)) -> None:
-    docs = list(
-        db.collection("keys")
-        .where("key", "==", x_api_key)
-        .stream()
-    )
+    try:
+        docs = list(
+            db.collection("keys")
+            .where("key", "==", x_api_key)
+            .stream()
+        )
+    except Exception as e:
+        logger.error(f"Firestore query failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Authorization service unavailable"
+        )
 
     if not docs:
         raise HTTPException(
@@ -89,27 +126,41 @@ def authorize(x_api_key: str = Header(...)) -> None:
             detail="Invalid or missing X-API-Key"
         )
 
-    expires_at = docs[0].to_dict().get("expiresAt")
-
-    if expires_at and expires_at < datetime.now(timezone.utc):
+    try:
+        expires_at = docs[0].to_dict().get("expiresAt")
+        if expires_at and expires_at < datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=401,
+                detail="API key has expired"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to check expiration: {e}")
         raise HTTPException(
-            status_code=401,
-            detail="API key has expired"
+            status_code=500,
+            detail="Authorization validation failed"
         )
 
     rate_limit_key = f"rate_limit:{x_api_key}"
 
-    count = redis.incr(rate_limit_key)
-
-    if count == 1:
-        redis.expire(rate_limit_key, 60)
-
-    if count > 10:
+    try:
+        count = redis.incr(rate_limit_key)
+        if count == 1:
+            redis.expire(rate_limit_key, 60)
+        if count > 10:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Redis rate limit failed: {e}")
         raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded"
+            status_code=500,
+            detail="Rate limiting service unavailable"
         )
-
 
 BUILDING_ERA_CATS = [
     "стар",
@@ -130,7 +181,6 @@ ROOM_MAP = {
     "garage/parking": 1,
     "other": 2
 }
-
 
 class PredictRequest(BaseModel):
     oblast: str
@@ -156,11 +206,9 @@ class PredictRequest(BaseModel):
     building_age: int = 20
     building_era: str = "среден"
 
-
 @app.get("/api")
 def health():
     return {"status": "ok"}
-
 
 @app.post("/api/predict")
 def predict(req: PredictRequest, _=Depends(authorize)):
@@ -174,11 +222,9 @@ def predict(req: PredictRequest, _=Depends(authorize)):
 
     if city_key in CITY_MODELS:
         model_name, bundle = CITY_MODELS[city_key]
-
     elif city_key in cities_from_csv:
         model_name = "Horizon"
         bundle = horizon_bundle
-
     else:
         raise HTTPException(
             status_code=400,
@@ -186,13 +232,19 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         )
 
     try:
-        model = bundle["model"]
-        district_medians = bundle["district_medians"]
-        city_medians = bundle["city_medians"]
-        global_median = bundle["global_median"]
-        cat_cols = bundle["cat_cols"]
-        features = bundle["features"]
-        category_values = bundle["category_values"]
+        model = bundle.get("model")
+        if model is None:
+            raise ValueError("Model not found in bundle")
+        
+        district_medians = bundle.get("district_medians", {})
+        city_medians = bundle.get("city_medians", {})
+        global_median = bundle.get("global_median", 0)
+        cat_cols = bundle.get("cat_cols", [])
+        features = bundle.get("features", [])
+        category_values = bundle.get("category_values", {})
+
+        if not features:
+            raise ValueError("Features list is empty")
 
         is_ground = 1 if req.floor == 1 else 0
         is_top = 1 if req.floor == req.total_floors else 0
@@ -222,6 +274,24 @@ def predict(req: PredictRequest, _=Depends(authorize)):
             else "other"
         )
 
+        construction_val = (
+            req.construction
+            if req.construction in category_values.get("construction", [])
+            else "тухла"
+        )
+
+        izlozhenie_val = (
+            req.izlozhenie
+            if req.izlozhenie in category_values.get("изложение", [])
+            else "юг"
+        )
+
+        building_era_val = (
+            req.building_era
+            if req.building_era in BUILDING_ERA_CATS
+            else "среден"
+        )
+
         row = {
             "district_baseline": dist_base,
             "city_baseline": city_base,
@@ -233,20 +303,12 @@ def predict(req: PredictRequest, _=Depends(authorize)):
             "floor": req.floor,
             "total_floors": req.total_floors,
             "floor_ratio": req.floor / max(req.total_floors, 1),
-            "sqm_per_room": req.area / estimated_rooms,
+            "sqm_per_room": req.area / max(estimated_rooms, 1),
             "is_ground": is_ground,
             "is_top": is_top,
             "is_middle": is_middle,
-            "construction": (
-                req.construction
-                if req.construction in category_values["construction"]
-                else "тухла"
-            ),
-            "изложение": (
-                req.izlozhenie
-                if req.izlozhenie in category_values["изложение"]
-                else "юг"
-            ),
+            "construction": construction_val,
+            "изложение": izlozhenie_val,
             "elevator": to_nan(req.elevator),
             "access_control": to_nan(req.access_control),
             "parking": to_nan(req.parking),
@@ -259,11 +321,7 @@ def predict(req: PredictRequest, _=Depends(authorize)):
             "is_lux": to_nan(req.is_lux),
             "seller_type": req.seller_type,
             "building_age": req.building_age,
-            "building_era": (
-                req.building_era
-                if req.building_era in BUILDING_ERA_CATS
-                else "среден"
-            ),
+            "building_era": building_era_val,
             "renovated_x_lux": (
                 1.0
                 if (req.is_renovated and req.is_lux)
@@ -279,6 +337,8 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         input_df = pd.DataFrame([row])
 
         for col in cat_cols:
+            if col not in input_df.columns:
+                continue
             if col == "building_era":
                 input_df[col] = pd.Categorical(
                     input_df[col],
@@ -286,10 +346,16 @@ def predict(req: PredictRequest, _=Depends(authorize)):
                     ordered=True
                 )
             else:
-                input_df[col] = pd.Categorical(
-                    input_df[col],
-                    categories=category_values[col]
-                )
+                cats = category_values.get(col, [])
+                if cats:
+                    input_df[col] = pd.Categorical(
+                        input_df[col],
+                        categories=cats
+                    )
+
+        missing_features = [f for f in features if f not in input_df.columns]
+        if missing_features:
+            raise ValueError(f"Missing features: {missing_features}")
 
         pred_log = model.predict(
             input_df[features]
@@ -306,10 +372,24 @@ def predict(req: PredictRequest, _=Depends(authorize)):
             "model": model_name
         }
 
+    except HTTPException:
+        raise
+    except KeyError as e:
+        logger.error(f"Key error in predict: {e}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Missing data field: {e}"
+        )
+    except ValueError as e:
+        logger.error(f"Value error in predict: {e}")
+        raise HTTPException(
+            status_code=422,
+            detail=str(e)
+        )
     except Exception as e:
         logger.error("Predict failed for req=%s", req.model_dump())
         logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=422,
-            detail=f"{type(e).__name__}: {e}"
+            detail=f"{type(e).__name__}: {str(e)}"
         )
