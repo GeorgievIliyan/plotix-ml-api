@@ -213,13 +213,19 @@ def predict(req: PredictRequest, _=Depends(authorize)):
     def to_nan(v):
         return 1.0 if v else np.nan
 
+    safe_type = (
+        req.type
+        if "type" not in cat_cols or req.type in category_values.get("type", [])
+        else "other"
+    )
+
     row = {
         "district_baseline": dist_base,
         "city_baseline": city_base,
         "oblast": req.oblast,
         "city": req.city,
         "district": req.district,
-        "type": req.type,
+        "type": safe_type,
         "area": req.area,
         "floor": req.floor,
         "total_floors": req.total_floors,
@@ -282,9 +288,15 @@ def predict(req: PredictRequest, _=Depends(authorize)):
                 categories=category_values[col]
             )
 
-    pred_log = model.predict(
-        input_df[features]
-    )[0]
+    try:
+        pred_log = model.predict(
+            input_df[features]
+        )[0]
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Model prediction failed: {e}"
+        )
 
     pred_price_sqm = float(np.exp(pred_log))
     total_price = pred_price_sqm * req.area
