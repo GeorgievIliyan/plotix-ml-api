@@ -1,5 +1,7 @@
 import pickle
 import json
+import logging
+import traceback
 import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Header
@@ -12,6 +14,9 @@ from upstash_redis import Redis
 from datetime import datetime, timezone
 
 load_dotenv()
+
+logger = logging.getLogger("plotix_predict")
+logging.basicConfig(level=logging.INFO)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 KEY_PATH = BASE_DIR / ".secret" / "serviceAccount.json"
@@ -42,7 +47,6 @@ MODEL_PATHS = {
 CSV_PATH = MODEL_DIR / "listings.csv"
 
 
-# Load models
 with open(MODEL_PATHS["atlas"], "rb") as f:
     atlas_bundle = pickle.load(f)
 
@@ -53,7 +57,6 @@ with open(MODEL_PATHS["horizon"], "rb") as f:
     horizon_bundle = pickle.load(f)
 
 
-# Load cities from CSV
 df = pd.read_csv(CSV_PATH)
 
 cities_from_csv = set(
@@ -182,129 +185,131 @@ def predict(req: PredictRequest, _=Depends(authorize)):
             detail=f"Unsupported city: {req.city}"
         )
 
-    model = bundle["model"]
-    district_medians = bundle["district_medians"]
-    city_medians = bundle["city_medians"]
-    global_median = bundle["global_median"]
-    cat_cols = bundle["cat_cols"]
-    features = bundle["features"]
-    category_values = bundle["category_values"]
-
-    is_ground = 1 if req.floor == 1 else 0
-    is_top = 1 if req.floor == req.total_floors else 0
-    is_middle = 1 if (not is_ground and not is_top) else 0
-
-    dist_base = district_medians.get(
-        req.district,
-        global_median
-    )
-
-    city_base = city_medians.get(
-        req.city,
-        global_median
-    )
-
-    estimated_rooms = ROOM_MAP.get(
-        req.type,
-        2
-    )
-
-    # без негативен ефект | no negative effect
-    def to_nan(v):
-        return 1.0 if v else np.nan
-
-    safe_type = (
-        req.type
-        if "type" not in cat_cols or req.type in category_values.get("type", [])
-        else "other"
-    )
-
-    row = {
-        "district_baseline": dist_base,
-        "city_baseline": city_base,
-        "oblast": req.oblast,
-        "city": req.city,
-        "district": req.district,
-        "type": safe_type,
-        "area": req.area,
-        "floor": req.floor,
-        "total_floors": req.total_floors,
-        "floor_ratio": req.floor / max(req.total_floors, 1),
-        "sqm_per_room": req.area / estimated_rooms,
-        "is_ground": is_ground,
-        "is_top": is_top,
-        "is_middle": is_middle,
-        "construction": (
-            req.construction
-            if req.construction in category_values["construction"]
-            else "тухла"
-        ),
-        "изложение": (
-            req.izlozhenie
-            if req.izlozhenie in category_values["изложение"]
-            else "юг"
-        ),
-        "elevator": to_nan(req.elevator),
-        "access_control": to_nan(req.access_control),
-        "parking": to_nan(req.parking),
-        "ac": to_nan(req.ac),
-        "furnished": to_nan(req.furnished),
-        "тец": to_nan(req.tec),
-        "act_16": to_nan(req.act_16),
-        "is_renovated": to_nan(req.is_renovated),
-        "is_bds": to_nan(req.is_bds),
-        "is_lux": to_nan(req.is_lux),
-        "seller_type": req.seller_type,
-        "building_age": req.building_age,
-        "building_era": (
-            req.building_era
-            if req.building_era in BUILDING_ERA_CATS
-            else "среден"
-        ),
-        "renovated_x_lux": (
-            1.0
-            if (req.is_renovated and req.is_lux)
-            else np.nan
-        ),
-        "furnished_x_renovated": (
-            1.0
-            if (req.furnished and req.is_renovated)
-            else np.nan
-        ),
-    }
-
-    input_df = pd.DataFrame([row])
-
-    for col in cat_cols:
-        if col == "building_era":
-            input_df[col] = pd.Categorical(
-                input_df[col],
-                categories=BUILDING_ERA_CATS,
-                ordered=True
-            )
-        else:
-            input_df[col] = pd.Categorical(
-                input_df[col],
-                categories=category_values[col]
-            )
-
     try:
+        model = bundle["model"]
+        district_medians = bundle["district_medians"]
+        city_medians = bundle["city_medians"]
+        global_median = bundle["global_median"]
+        cat_cols = bundle["cat_cols"]
+        features = bundle["features"]
+        category_values = bundle["category_values"]
+
+        is_ground = 1 if req.floor == 1 else 0
+        is_top = 1 if req.floor == req.total_floors else 0
+        is_middle = 1 if (not is_ground and not is_top) else 0
+
+        dist_base = district_medians.get(
+            req.district,
+            global_median
+        )
+
+        city_base = city_medians.get(
+            req.city,
+            global_median
+        )
+
+        estimated_rooms = ROOM_MAP.get(
+            req.type,
+            2
+        )
+
+        def to_nan(v):
+            return 1.0 if v else np.nan
+
+        safe_type = (
+            req.type
+            if "type" not in cat_cols or req.type in category_values.get("type", [])
+            else "other"
+        )
+
+        row = {
+            "district_baseline": dist_base,
+            "city_baseline": city_base,
+            "oblast": req.oblast,
+            "city": req.city,
+            "district": req.district,
+            "type": safe_type,
+            "area": req.area,
+            "floor": req.floor,
+            "total_floors": req.total_floors,
+            "floor_ratio": req.floor / max(req.total_floors, 1),
+            "sqm_per_room": req.area / estimated_rooms,
+            "is_ground": is_ground,
+            "is_top": is_top,
+            "is_middle": is_middle,
+            "construction": (
+                req.construction
+                if req.construction in category_values["construction"]
+                else "тухла"
+            ),
+            "изложение": (
+                req.izlozhenie
+                if req.izlozhenie in category_values["изложение"]
+                else "юг"
+            ),
+            "elevator": to_nan(req.elevator),
+            "access_control": to_nan(req.access_control),
+            "parking": to_nan(req.parking),
+            "ac": to_nan(req.ac),
+            "furnished": to_nan(req.furnished),
+            "тец": to_nan(req.tec),
+            "act_16": to_nan(req.act_16),
+            "is_renovated": to_nan(req.is_renovated),
+            "is_bds": to_nan(req.is_bds),
+            "is_lux": to_nan(req.is_lux),
+            "seller_type": req.seller_type,
+            "building_age": req.building_age,
+            "building_era": (
+                req.building_era
+                if req.building_era in BUILDING_ERA_CATS
+                else "среден"
+            ),
+            "renovated_x_lux": (
+                1.0
+                if (req.is_renovated and req.is_lux)
+                else np.nan
+            ),
+            "furnished_x_renovated": (
+                1.0
+                if (req.furnished and req.is_renovated)
+                else np.nan
+            ),
+        }
+
+        input_df = pd.DataFrame([row])
+
+        for col in cat_cols:
+            if col == "building_era":
+                input_df[col] = pd.Categorical(
+                    input_df[col],
+                    categories=BUILDING_ERA_CATS,
+                    ordered=True
+                )
+            else:
+                input_df[col] = pd.Categorical(
+                    input_df[col],
+                    categories=category_values[col]
+                )
+
         pred_log = model.predict(
             input_df[features]
         )[0]
+
+        pred_price_sqm = float(np.exp(pred_log))
+        total_price = pred_price_sqm * req.area
+
+        return {
+            "price_per_sqm": round(pred_price_sqm, 2),
+            "total_price": round(total_price, 2),
+            "district_baseline": round(float(dist_base), 2),
+            "city_baseline": round(float(city_base), 2),
+            "model": model_name
+        }
+
     except Exception as e:
+        logger.error("Predict failed for req=%s", req.model_dump())
+        logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=422,
-            detail=f"Model prediction failed: {e}"
+            detail=f"{type(e).__name__}: {e}"
         )
-
-    pred_price_sqm = float(np.exp(pred_log))
-    total_price = pred_price_sqm * req.area
-
-    return {
-        "price_per_sqm": round(pred_price_sqm, 2),
-        "total_price": round(total_price, 2),
-        "district_baseline": round(float(dist_base), 2),
-        "city_baseline": round(float(city_base), 2),
-        "model": model_name
-    }
