@@ -112,6 +112,7 @@ CITY_MODELS = {
     "бургас": ("Atlas", atlas_bundle),
 }
 
+
 def authorize(x_api_key: str = Header(...)) -> None:
     normalized_key = x_api_key.strip()
 
@@ -136,13 +137,16 @@ def authorize(x_api_key: str = Header(...)) -> None:
 
     try:
         expires_at = docs[0].to_dict().get("expiresAt")
+
         if expires_at and expires_at < datetime.now(timezone.utc):
             raise HTTPException(
                 status_code=401,
                 detail="Unauthorized"
             )
+
     except HTTPException:
         raise
+
     except Exception as e:
         logger.error(f"Failed to check expiration: {e}")
         raise HTTPException(
@@ -163,14 +167,17 @@ def authorize(x_api_key: str = Header(...)) -> None:
                 status_code=429,
                 detail="Rate limit exceeded"
             )
+
     except HTTPException:
         raise
+
     except Exception as e:
         logger.error(f"Redis rate limit failed: {e}")
         raise HTTPException(
             status_code=503,
             detail="Service temporarily unavailable"
         )
+
 
 BUILDING_ERA_CATS = [
     "стар",
@@ -191,6 +198,7 @@ ROOM_MAP = {
     "garage/parking": 1,
     "other": 2
 }
+
 
 class PredictRequest(BaseModel):
     oblast: str
@@ -216,6 +224,7 @@ class PredictRequest(BaseModel):
     building_age: int = 20
     building_era: str = "среден"
 
+
 def normalize_against_categories(value: str, categories: list) -> str:
     if not value:
         return value
@@ -229,6 +238,7 @@ def normalize_against_categories(value: str, categories: list) -> str:
             return category
 
     return value.strip()
+
 
 def normalize_city_for_model(value: str, category_values: dict) -> str:
     categories = category_values.get("city", [])
@@ -263,6 +273,7 @@ def normalize_city_for_model(value: str, category_values: dict) -> str:
 
     return value.strip()
 
+
 def normalize_oblast_for_model(value: str, category_values: dict) -> str:
     categories = category_values.get("oblast", [])
 
@@ -290,6 +301,7 @@ def normalize_oblast_for_model(value: str, category_values: dict) -> str:
 
     return value.strip()
 
+
 def normalize_district_for_model(value: str, category_values: dict) -> str:
     categories = category_values.get("district", [])
 
@@ -301,9 +313,11 @@ def normalize_district_for_model(value: str, category_values: dict) -> str:
         categories
     )
 
+
 @app.get("/api")
 def health():
     return {"status": "ok"}
+
 
 @app.post("/api/predict")
 def predict(req: PredictRequest, _=Depends(authorize)):
@@ -317,9 +331,11 @@ def predict(req: PredictRequest, _=Depends(authorize)):
 
     if city_key in CITY_MODELS:
         model_name, bundle = CITY_MODELS[city_key]
+
     elif city_key in cities_from_csv:
         model_name = "Horizon"
         bundle = horizon_bundle
+
     else:
         city_without_prefix = city_key
 
@@ -328,9 +344,11 @@ def predict(req: PredictRequest, _=Depends(authorize)):
 
         if city_without_prefix in CITY_MODELS:
             model_name, bundle = CITY_MODELS[city_without_prefix]
+
         elif city_without_prefix in cities_from_csv:
             model_name = "Horizon"
             bundle = horizon_bundle
+
         else:
             raise HTTPException(
                 status_code=400,
@@ -363,6 +381,23 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         normalized_district = normalize_district_for_model(
             req.district,
             category_values
+        )
+
+        district_medians = bundle.get("district_medians", {})
+        city_medians = bundle.get("city_medians", {})
+        global_median = bundle.get("global_median")
+
+        if global_median is None:
+            raise ValueError("Global median not found in bundle")
+
+        district_baseline = district_medians.get(
+            normalized_district,
+            global_median
+        )
+
+        city_baseline = city_medians.get(
+            normalized_city,
+            global_median
         )
 
         is_ground = 1 if req.floor == 1 else 0
@@ -411,6 +446,8 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         )
 
         row = {
+            "district_baseline": district_baseline,
+            "city_baseline": city_baseline,
             "oblast": normalized_oblast,
             "city": normalized_city,
             "district": normalized_district,
@@ -447,7 +484,7 @@ def predict(req: PredictRequest, _=Depends(authorize)):
                 1.0
                 if (req.furnished and req.is_renovated)
                 else np.nan
-            ),
+            )
         }
 
         input_df = pd.DataFrame([row])
