@@ -567,6 +567,14 @@ def predict(req: PredictRequest, _=Depends(authorize)):
                 total_price,
                 2
             ),
+            "district_baseline": round(
+                float(district_baseline),
+                2
+            ),
+            "city_baseline": round(
+                float(city_baseline),
+                2
+            ),
             "model": model_name
         }
 
