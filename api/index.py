@@ -13,11 +13,11 @@ from google.cloud import firestore
 from upstash_redis import Redis
 from datetime import datetime, timezone
 
-env_path = Path(__file__).resolve().parent.parent / '.env.local'
+env_path = Path(__file__).resolve().parent.parent / ".env.local"
 if env_path.exists():
     load_dotenv(dotenv_path=env_path)
 else:
-    env_path = Path(__file__).resolve().parent / '.env.local'
+    env_path = Path(__file__).resolve().parent / ".env.local"
     if env_path.exists():
         load_dotenv(dotenv_path=env_path)
 
@@ -34,8 +34,11 @@ try:
     else:
         if not KEY_PATH.exists():
             logger.error(f"Service account key not found: {KEY_PATH}")
-            raise FileNotFoundError(f"Service account key not found: {KEY_PATH}")
+            raise FileNotFoundError(
+                f"Service account key not found: {KEY_PATH}"
+            )
         db = firestore.Client.from_service_account_json(KEY_PATH)
+
     logger.info(f"Firestore connected to project: {db.project}")
 except Exception as e:
     logger.error(f"Failed to initialize Firestore: {e}")
@@ -78,8 +81,10 @@ if not CSV_PATH.exists():
 try:
     with open(MODEL_PATHS["atlas"], "rb") as f:
         atlas_bundle = pickle.load(f)
+
     with open(MODEL_PATHS["northpearl"], "rb") as f:
         northpearl_bundle = pickle.load(f)
+
     with open(MODEL_PATHS["horizon"], "rb") as f:
         horizon_bundle = pickle.load(f)
 except Exception as e:
@@ -149,8 +154,10 @@ def authorize(x_api_key: str = Header(...)) -> None:
 
     try:
         count = redis.incr(rate_limit_key)
+
         if count == 1:
             redis.expire(rate_limit_key, 60)
+
         if count > 10:
             raise HTTPException(
                 status_code=429,
@@ -209,6 +216,91 @@ class PredictRequest(BaseModel):
     building_age: int = 20
     building_era: str = "среден"
 
+def normalize_against_categories(value: str, categories: list) -> str:
+    if not value:
+        return value
+
+    value_clean = str(value).strip().lower()
+
+    for category in categories:
+        category_clean = str(category).strip().lower()
+
+        if value_clean == category_clean:
+            return category
+
+    return value.strip()
+
+def normalize_city_for_model(value: str, category_values: dict) -> str:
+    categories = category_values.get("city", [])
+
+    if not categories:
+        return value.strip()
+
+    normalized = normalize_against_categories(
+        value,
+        categories
+    )
+
+    if normalized in categories:
+        return normalized
+
+    value_clean = value.strip().lower()
+
+    for category in categories:
+        category_clean = str(category).strip().lower()
+
+        if category_clean.startswith("гр. "):
+            without_prefix = category_clean[4:].strip()
+
+            if value_clean == without_prefix:
+                return category
+
+        elif value_clean.startswith("гр. "):
+            without_prefix = value_clean[4:].strip()
+
+            if without_prefix == category_clean:
+                return category
+
+    return value.strip()
+
+def normalize_oblast_for_model(value: str, category_values: dict) -> str:
+    categories = category_values.get("oblast", [])
+
+    if not categories:
+        return value.strip()
+
+    normalized = normalize_against_categories(
+        value,
+        categories
+    )
+
+    if normalized in categories:
+        return normalized
+
+    value_clean = value.strip().lower()
+
+    for category in categories:
+        category_clean = str(category).strip().lower()
+
+        if category_clean == f"{value_clean} област":
+            return category
+
+        if category_clean == value_clean.replace(" област", ""):
+            return category
+
+    return value.strip()
+
+def normalize_district_for_model(value: str, category_values: dict) -> str:
+    categories = category_values.get("district", [])
+
+    if not categories:
+        return value.strip()
+
+    return normalize_against_categories(
+        value,
+        categories
+    )
+
 @app.get("/api")
 def health():
     return {"status": "ok"}
@@ -229,19 +321,28 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         model_name = "Horizon"
         bundle = horizon_bundle
     else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid request"
-        )
+        city_without_prefix = city_key
+
+        if city_without_prefix.startswith("гр. "):
+            city_without_prefix = city_without_prefix[4:].strip()
+
+        if city_without_prefix in CITY_MODELS:
+            model_name, bundle = CITY_MODELS[city_without_prefix]
+        elif city_without_prefix in cities_from_csv:
+            model_name = "Horizon"
+            bundle = horizon_bundle
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid request"
+            )
 
     try:
         model = bundle.get("model")
+
         if model is None:
             raise ValueError("Model not found in bundle")
 
-        district_medians = bundle.get("district_medians", {})
-        city_medians = bundle.get("city_medians", {})
-        global_median = bundle.get("global_median", 0)
         cat_cols = bundle.get("cat_cols", [])
         features = bundle.get("features", [])
         category_values = bundle.get("category_values", {})
@@ -249,19 +350,24 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         if not features:
             raise ValueError("Features list is empty")
 
+        normalized_oblast = normalize_oblast_for_model(
+            req.oblast,
+            category_values
+        )
+
+        normalized_city = normalize_city_for_model(
+            req.city,
+            category_values
+        )
+
+        normalized_district = normalize_district_for_model(
+            req.district,
+            category_values
+        )
+
         is_ground = 1 if req.floor == 1 else 0
         is_top = 1 if req.floor == req.total_floors else 0
         is_middle = 1 if (not is_ground and not is_top) else 0
-
-        dist_base = district_medians.get(
-            req.district,
-            global_median
-        )
-
-        city_base = city_medians.get(
-            req.city,
-            global_median
-        )
 
         estimated_rooms = ROOM_MAP.get(
             req.type,
@@ -273,19 +379,28 @@ def predict(req: PredictRequest, _=Depends(authorize)):
 
         safe_type = (
             req.type
-            if "type" not in cat_cols or req.type in category_values.get("type", [])
+            if (
+                "type" not in cat_cols
+                or req.type in category_values.get("type", [])
+            )
             else "other"
         )
 
         construction_val = (
             req.construction
-            if req.construction in category_values.get("construction", [])
+            if req.construction in category_values.get(
+                "construction",
+                []
+            )
             else "тухла"
         )
 
         izlozhenie_val = (
             req.izlozhenie
-            if req.izlozhenie in category_values.get("изложение", [])
+            if req.izlozhenie in category_values.get(
+                "изложение",
+                []
+            )
             else "юг"
         )
 
@@ -296,11 +411,9 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         )
 
         row = {
-            "district_baseline": dist_base,
-            "city_baseline": city_base,
-            "oblast": req.oblast,
-            "city": req.city,
-            "district": req.district,
+            "oblast": normalized_oblast,
+            "city": normalized_city,
+            "district": normalized_district,
             "type": safe_type,
             "area": req.area,
             "floor": req.floor,
@@ -342,6 +455,7 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         for col in cat_cols:
             if col not in input_df.columns:
                 continue
+
             if col == "building_era":
                 input_df[col] = pd.Categorical(
                     input_df[col],
@@ -350,36 +464,70 @@ def predict(req: PredictRequest, _=Depends(authorize)):
                 )
             else:
                 cats = category_values.get(col, [])
+
                 if cats:
                     input_df[col] = pd.Categorical(
                         input_df[col],
                         categories=cats
                     )
 
-        missing_features = [f for f in features if f not in input_df.columns]
+        missing_features = [
+            f for f in features
+            if f not in input_df.columns
+        ]
+
         if missing_features:
-            raise ValueError(f"Missing features: {missing_features}")
+            raise ValueError(
+                f"Missing features: {missing_features}"
+            )
+
+        for col in cat_cols:
+            if col not in input_df.columns:
+                continue
+
+            if pd.isna(input_df[col].iloc[0]):
+                raise ValueError(
+                    f"Invalid categorical value for '{col}': "
+                    f"{row.get(col)!r}"
+                )
 
         pred_log = model.predict(
             input_df[features]
         )[0]
 
-        pred_price_sqm = float(np.exp(pred_log))
-        total_price = pred_price_sqm * req.area
+        pred_price_sqm = float(
+            np.exp(pred_log)
+        )
+
+        total_price = (
+            pred_price_sqm
+            * req.area
+        )
 
         return {
-            "price_per_sqm": round(pred_price_sqm, 2),
-            "total_price": round(total_price, 2),
-            "district_baseline": round(float(dist_base), 2),
-            "city_baseline": round(float(city_base), 2),
+            "price_per_sqm": round(
+                pred_price_sqm,
+                2
+            ),
+            "total_price": round(
+                total_price,
+                2
+            ),
             "model": model_name
         }
 
     except HTTPException:
         raise
+
     except Exception as e:
-        logger.error("Predict failed for req=%s", req.model_dump())
-        logger.error(traceback.format_exc())
+        logger.error(
+            "Predict failed for req=%s",
+            req.model_dump()
+        )
+        logger.error(
+            traceback.format_exc()
+        )
+
         raise HTTPException(
             status_code=500,
             detail="Prediction failed"
