@@ -37,9 +37,11 @@ try:
             raise FileNotFoundError(
                 f"Service account key not found: {KEY_PATH}"
             )
+
         db = firestore.Client.from_service_account_json(KEY_PATH)
 
     logger.info(f"Firestore connected to project: {db.project}")
+
 except Exception as e:
     logger.error(f"Failed to initialize Firestore: {e}")
     raise
@@ -53,6 +55,7 @@ if not redis_url or not redis_token:
 
 try:
     redis = Redis(url=redis_url, token=redis_token)
+
 except Exception as e:
     logger.error(f"Failed to initialize Redis: {e}")
     raise
@@ -87,12 +90,14 @@ try:
 
     with open(MODEL_PATHS["horizon"], "rb") as f:
         horizon_bundle = pickle.load(f)
+
 except Exception as e:
     logger.error(f"Failed to load pickle files: {e}")
     raise
 
 try:
     df = pd.read_csv(CSV_PATH)
+
 except Exception as e:
     logger.error(f"Failed to read CSV: {e}")
     raise
@@ -122,11 +127,12 @@ def authorize(x_api_key: str = Header(...)) -> None:
             .where("key", "==", normalized_key)
             .stream()
         )
+
     except Exception as e:
         logger.error(f"Firestore query failed: {e}")
         raise HTTPException(
             status_code=503,
-            detail="Service temporarily unavailable"
+            detail=f"Firestore error: {type(e).__name__}: {e}"
         )
 
     if not docs:
@@ -151,7 +157,7 @@ def authorize(x_api_key: str = Header(...)) -> None:
         logger.error(f"Failed to check expiration: {e}")
         raise HTTPException(
             status_code=503,
-            detail="Service temporarily unavailable"
+            detail=f"Expiration check error: {type(e).__name__}: {e}"
         )
 
     rate_limit_key = f"rate_limit:{normalized_key}"
@@ -175,7 +181,7 @@ def authorize(x_api_key: str = Header(...)) -> None:
         logger.error(f"Redis rate limit failed: {e}")
         raise HTTPException(
             status_code=503,
-            detail="Service temporarily unavailable"
+            detail=f"Redis error: {type(e).__name__}: {e}"
         )
 
 
@@ -271,6 +277,9 @@ def normalize_city_for_model(value: str, category_values: dict) -> str:
             if without_prefix == category_clean:
                 return category
 
+    if "other" in categories:
+        return "other"
+
     return value.strip()
 
 
@@ -308,10 +317,18 @@ def normalize_district_for_model(value: str, category_values: dict) -> str:
     if not categories:
         return value.strip()
 
-    return normalize_against_categories(
+    normalized = normalize_against_categories(
         value,
         categories
     )
+
+    if normalized in categories:
+        return normalized
+
+    if "other" in categories:
+        return "other"
+
+    return value.strip()
 
 
 @app.get("/api")
@@ -324,7 +341,7 @@ def predict(req: PredictRequest, _=Depends(authorize)):
     if req.area <= 0:
         raise HTTPException(
             status_code=400,
-            detail="Invalid request"
+            detail=f"Invalid area: {req.area}. Area must be greater than 0."
         )
 
     city_key = req.city.strip().lower()
@@ -352,7 +369,7 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid request"
+                detail=f"Unsupported city: {req.city}"
             )
 
     try:
@@ -557,15 +574,25 @@ def predict(req: PredictRequest, _=Depends(authorize)):
         raise
 
     except Exception as e:
+        error_type = type(e).__name__
+        error_message = str(e)
+
         logger.error(
             "Predict failed for req=%s",
             req.model_dump()
         )
+
+        logger.error(
+            "Predict error: %s: %s",
+            error_type,
+            error_message
+        )
+
         logger.error(
             traceback.format_exc()
         )
 
         raise HTTPException(
             status_code=500,
-            detail="Prediction failed"
+            detail=f"{error_type}: {error_message}"
         )
